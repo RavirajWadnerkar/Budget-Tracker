@@ -1,0 +1,186 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+    function workspace(workspaceId) {
+      return get(/databases/$(database)/documents/workspaces/$(workspaceId)).data;
+    }
+    function isMember(workspaceId) {
+      return isSignedIn() &&
+        request.auth.uid in workspace(workspaceId).memberIds;
+    }
+    function isOwner(workspaceId) {
+      return isSignedIn() &&
+        request.auth.uid == workspace(workspaceId).ownerId;
+    }
+    // The actor stamp on writes must match the signed-in user
+    function isActor(field) {
+      return request.resource.data[field] == request.auth.uid;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Users — public-readable profiles, only self-writable.
+    // (Membership lookups need to read other users' display names.)
+    // ─────────────────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isSelf(userId);
+      allow update: if isSelf(userId);
+      allow delete: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Workspaces — personal or joint.
+    // ─────────────────────────────────────────────────────────
+    match /workspaces/{workspaceId} {
+      // Members can read.
+      allow read: if isSignedIn() &&
+        request.auth.uid in resource.data.memberIds;
+
+      // Anyone signed in can create a workspace where they are the owner
+      // and the sole initial member.
+      allow create: if isSignedIn() &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.memberIds.hasOnly([request.auth.uid]) &&
+        request.resource.data.memberIds.hasAll([request.auth.uid]) &&
+        (request.resource.data.type == 'personal' ||
+         request.resource.data.type == 'joint');
+
+      // Update rules:
+      // - Owner can update name/memberIds (e.g. remove members).
+      // - A member can remove themselves (leave).
+      // - An invited user can add themselves to memberIds via accepting an
+      //   invite — we allow a single-uid arrayUnion of self when they're not
+      //   already a member, gated by the presence of a pending invite. The
+      //   invite document itself is verified separately.
+      // - ownerId, type, createdAt are immutable post-create.
+      allow update: if isSignedIn() &&
+        request.resource.data.ownerId == resource.data.ownerId &&
+        request.resource.data.type == resource.data.type &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        (
+          // Owner can change anything else allowed
+          request.auth.uid == resource.data.ownerId ||
+          // Member leaving themselves
+          (
+            request.auth.uid in resource.data.memberIds &&
+            !(request.auth.uid in request.resource.data.memberIds) &&
+            // Only memberIds changed — name unchanged
+            request.resource.data.name == resource.data.name
+          ) ||
+          // Joining via an accepted invite (self-add only)
+          (
+            !(request.auth.uid in resource.data.memberIds) &&
+            request.auth.uid in request.resource.data.memberIds &&
+            request.resource.data.memberIds.size() ==
+              resource.data.memberIds.size() + 1 &&
+            request.resource.data.name == resource.data.name
+          )
+        );
+
+      // Only the owner can delete the workspace.
+      allow delete: if isSignedIn() &&
+        request.auth.uid == resource.data.ownerId;
+
+      // ───────────── Expenses ─────────────
+      match /expenses/{expenseId} {
+        allow read: if isMember(workspaceId);
+
+        // Create: stamp must match caller; createdBy/At and updatedBy/At
+        // must be set to the caller.
+        allow create: if isMember(workspaceId) &&
+          isActor('createdByUserId') &&
+          isActor('updatedByUserId') &&
+          request.resource.data.workspaceId == workspaceId;
+
+        // Update: createdBy/At immutable; updatedBy must be caller.
+        allow update: if isMember(workspaceId) &&
+          request.resource.data.createdByUserId == resource.data.createdByUserId &&
+          request.resource.data.createdAt == resource.data.createdAt &&
+          isActor('updatedByUserId');
+
+        allow delete: if isMember(workspaceId);
+      }
+
+      // ───────────── Budgets ─────────────
+      match /budgets/{monthKey} {
+        allow read: if isMember(workspaceId);
+
+        allow create: if isMember(workspaceId) &&
+          isActor('updatedByUserId');
+
+        allow update: if isMember(workspaceId) &&
+          isActor('updatedByUserId');
+
+        allow delete: if isOwner(workspaceId);
+      }
+
+      // ───────────── Activity logs ─────────────
+      match /activityLogs/{logId} {
+        allow read: if isMember(workspaceId);
+
+        // Anyone in the workspace can write a log entry stamped with their uid.
+        allow create: if isMember(workspaceId) &&
+          isActor('userId');
+
+        // Logs are immutable after creation.
+        allow update, delete: if false;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Invites — sent to an email address; readable to inviter and invitee.
+    // ─────────────────────────────────────────────────────────
+    match /invites/{inviteId} {
+      allow read: if isSignedIn() && (
+        resource.data.invitedByUserId == request.auth.uid ||
+        (
+          request.auth.token.email != null &&
+          resource.data.invitedEmail == request.auth.token.email.lower()
+        )
+      );
+
+      // Only an owner of the target household can create an invite.
+      allow create: if isSignedIn() &&
+        request.resource.data.invitedByUserId == request.auth.uid &&
+        request.resource.data.status == 'pending' &&
+        get(/databases/$(database)/documents/workspaces/$(request.resource.data.householdId)).data.ownerId == request.auth.uid;
+
+      // Update: only the invitee can accept (pending → accepted),
+      // anyone listed (inviter or invitee) can mark as rejected.
+      allow update: if isSignedIn() && (
+        // Invitee accepting their own invite
+        (
+          resource.data.invitedEmail == request.auth.token.email.lower() &&
+          resource.data.status == 'pending' &&
+          request.resource.data.status == 'accepted' &&
+          request.resource.data.invitedEmail == resource.data.invitedEmail &&
+          request.resource.data.householdId == resource.data.householdId &&
+          request.resource.data.invitedByUserId == resource.data.invitedByUserId
+        ) ||
+        // Invitee rejecting
+        (
+          resource.data.invitedEmail == request.auth.token.email.lower() &&
+          resource.data.status == 'pending' &&
+          request.resource.data.status == 'rejected'
+        )
+      );
+
+      // Inviter can cancel (delete) their own invite; invitee can also
+      // delete invites addressed to them.
+      allow delete: if isSignedIn() && (
+        resource.data.invitedByUserId == request.auth.uid ||
+        resource.data.invitedEmail == request.auth.token.email.lower()
+      );
+    }
+  }
+}
